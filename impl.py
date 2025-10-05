@@ -105,16 +105,30 @@ class JournalUploadHandler(UploadHandler):
     """
 
     def pushDataToDb(self, csv_path: str) -> bool:
-        endpoint = self.getDbPathOrUrl().strip()
-        if not endpoint:
-            raise ValueError("SPARQL endpoint not set. Call setDbPathOrUrl(...) first.")
-        if not endpoint.endswith("/sparql"):
-            endpoint = endpoint.rstrip("/") + "/sparql"
+    endpoint = self.getDbPathOrUrl().strip()
+    if not endpoint:
+        raise ValueError("SPARQL endpoint not set. Call setDbPathOrUrl(...) first.")
+    if not endpoint.endswith("/sparql"):
+        endpoint = endpoint.rstrip("/") + "/sparql"
 
-        # Read CSV robustly (handles quoted commas in titles)
-        with open(csv_path, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        
+        required = {
+            "Journal title",
+            "Journal ISSN (print version)",
+            "Journal EISSN (online version)",
+            "Languages in which the journal accepts manuscripts",
+            "Publisher",
+            "DOAJ Seal",
+            "Journal license",
+            "APC",
+        }
+        if not required.issubset(reader.fieldnames or set()):
+            missing = required - set(reader.fieldnames or [])
+            raise ValueError(f"CSV is missing required columns: {sorted(missing)}")
+        rows = list(reader)
+
 
         batch, batch_size = [], 800
 
