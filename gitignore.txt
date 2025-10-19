@@ -1,6 +1,0 @@
-blazegraph.*
-impl.py
-*.xlsx
-__pycache__/
-private/
-testfull.py
