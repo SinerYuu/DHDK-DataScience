@@ -211,6 +211,7 @@ class QueryHandler(Handler):
 # -------------------- Graph/Blazegraph helpers --------------------
 
 SCHEMA = Namespace("https://schema.org/")
+EX = Namespace("http://example.org/")  # <— added for categories + links
 
 def _bool_from_str(v: Any) -> Optional[bool]:
     if isinstance(v, bool):
