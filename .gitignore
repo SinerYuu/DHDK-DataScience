@@ -1,0 +1,6 @@
+blazegraph.jnl
+blazegraph.jar
+__pycache__/
+.venv/
+.DS_Store
+.vscode/

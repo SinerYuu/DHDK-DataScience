@@ -1,4 +1,3 @@
-
 from typing import List, Optional, Set, Dict, Any, Tuple
 from collections import OrderedDict
 import json
@@ -212,38 +211,46 @@ class QueryHandler(Handler):
 
 SCHEMA = Namespace("https://schema.org/")
 
+# --- helper: convert textual values like "Yes"/"No" into Python booleans ---
 def _bool_from_str(v: Any) -> Optional[bool]:
     if isinstance(v, bool):
         return v
-    if isinstance(v, str):
-        w = v.strip().lower()
-        if w in {"true","yes","y","1"}: return True
-        if w in {"false","no","n","0"}: return False
+    if v is None:
+        return None
+    w = str(v).strip().lower()
+    if w in {"true", "yes", "y", "1"}:
+        return True
+    if w in {"false", "no", "n", "0"}:
+        return False
     return None
 
+# --- helper: build a clean URI for each journal using its ISSN ---
 def _build_journal_uri(issn: str) -> URIRef:
-    # A stable URI pattern for journal resources
-    return URIRef(f"http://example.org/periodical/{issn}")
+    # remove dashes and keep only digits/X, then attach to base URI
+    norm = re.sub(r"[^0-9xX]", "", issn or "")
+    return URIRef(f"http://example.org/periodical/{norm}")
 
 
 class _BlazegraphClient:
     """
-    Minimal rdflib-powered client for Blazegraph.
-    Uses SPARQLUpdateStore for updates, SPARQLStore for selects.
+    Minimal helper client that communicates with the Blazegraph SPARQL endpoint.
+    Uses rdflib's SPARQLUpdateStore for uploads and SPARQLStore for SELECT queries.
     """
     def __init__(self, endpoint: str):
         self.endpoint = endpoint
 
     def _update_store(self) -> SPARQLUpdateStore:
+        # connection for INSERT/UPDATE operations
         store = SPARQLUpdateStore()
-        # Blazegraph usually supports the same endpoint for query and update
-        store.open((self.endpoint, self.endpoint))
+        store.open((self.endpoint, self.endpoint)) # same URL used for both query and update
         return store
 
     def _select_store(self) -> SPARQLStore:
+        # connection for SELECT queries
         return SPARQLStore(self.endpoint)
 
     def upload_graph(self, g: Graph) -> bool:
+        """Send all triples from local graph `g` to the Blazegraph server."""
         try:
             store = self._update_store()
             # Push triples directly via the store-connected Graph
@@ -252,13 +259,16 @@ class _BlazegraphClient:
                 G.add(t)
             return True
         except Exception:
+            # if server not reachable, silently fail (we still keep local cache)
             return False
 
     def select(self, query: str) -> List[Dict[str, Any]]:
+        """Run a SPARQL SELECT query and return list of dict results."""
         store = self._select_store()
         g = Graph(store=store)
         rows = []
         for row in g.query(query):
+            # convert rdflib Bindings to simple python dict of strings
             binding = {}
             for var, val in row.asdict().items():
                 binding[var] = str(val) if val is not None else None
@@ -270,10 +280,9 @@ class _BlazegraphClient:
 
 class JournalUploadHandler(UploadHandler):
     """
-    Load DOAJ-like CSV and publish as RDF (schema.org) into Blazegraph using rdflib.
-    - Class: schema:Periodical
-    - Properties: schema:issn, schema:name, schema:publisher, schema:license, schema:inLanguage
-    - Extra booleans: schema:additionalProperty / schema:PropertyValue for APC and DOAJSeal
+    Handles reading the DOAJ-style CSV file and converting each journal entry
+    into RDF triples (schema.org vocabulary). Uploads them to Blazegraph and
+    stores a pandas DataFrame as local fallback.
     """
     def pushDataToDb(self, file_path: str) -> bool:
         reg = _ensure_registry(self.dbPathOrUrl)
@@ -283,35 +292,43 @@ class JournalUploadHandler(UploadHandler):
             if not os.path.isfile(path) and os.path.isfile(os.path.join(".", path)):
                 path = os.path.join(".", path)
             if not os.path.isfile(path):
-                # Keep empty table for fallback and succeed
+                # if file missing, keep empty fallback
                 reg["journals"] = pd.DataFrame(columns=["id","title","publisher","license","apc","doaj_seal","languages"])
                 return True
 
+            # --- Read CSV into pandas ---
             df_raw = pd.read_csv(path, dtype=str, keep_default_na=False)
 
-            # Flexible column mapping (case-insensitively)
+            # --- 3. Detect important columns, allowing for slight name variations ---
             cols_lower = {c.lower(): c for c in df_raw.columns}
-            def pick(*keys):
+            def pick_exact(*cands):
+                for c in cands:
+                    if c in df_raw.columns:
+                        return c
+                return None
+            def pick_fuzzy(*keys):
                 for k in keys:
                     for low, orig in cols_lower.items():
                         if k in low:
                             return orig
                 return None
 
-            col_issn = pick("issn", "eissn", "pissn", "journal id", "identifier")
-            col_title = pick("title")
-            col_publisher = pick("publisher")
-            col_license = pick("license")
-            col_apc = pick("apc", "article processing charge", "processing charges")
-            col_seal = pick("seal", "doaj")
-            col_lang = pick("language")
+            # choose the most likely column names
+            col_issn     = pick_exact("ISSN")         or pick_fuzzy("issn", "identifier")
+            col_title    = pick_exact("Journal title") or pick_fuzzy("title", "name")
+            col_publisher= pick_exact("Publisher")     or pick_fuzzy("publisher")
+            col_license  = pick_exact("License")       or pick_fuzzy("license", "licence")
+            col_apc      = pick_exact("APC")           or pick_fuzzy("apc", "processing charge")
+            col_seal     = pick_exact("DOAJ Seal")     or pick_fuzzy("seal", "doaj")
+            col_lang     = pick_exact("Languages")     or pick_fuzzy("language", "languages")
 
-            # Build RDF graph
+            # --- Prepare RDF graph and fallback table ---
             g = Graph()
             g.bind("schema", SCHEMA)
 
             fallback_rows = []
 
+            # --- Iterate over CSV rows and build triples ---
             for _, row in df_raw.iterrows():
                 issn = (str(row[col_issn]).strip() if col_issn and str(row[col_issn]).strip() else "")
                 title = str(row[col_title]).strip() if col_title else ""
@@ -320,12 +337,13 @@ class JournalUploadHandler(UploadHandler):
                 apc = _bool_from_str(row[col_apc]) if col_apc else None
                 seal = _bool_from_str(row[col_seal]) if col_seal else None
                 langs_raw = str(row[col_lang]).strip() if col_lang else ""
-                languages = [l.strip() for l in langs_raw.split(",")] if langs_raw else []
+                # languages separated by ", " (comma + space)
+                languages = [l.strip() for l in langs_raw.split(", ")] if langs_raw else []
 
                 if not issn and not title:
-                    continue
+                    continue  # skip invalid rows
 
-                # Fallback cache row (used only if Blazegraph integration unavailable)
+                # record for local fallback DataFrame
                 fallback_rows.append({
                     "id": issn or title,
                     "title": title,
@@ -336,7 +354,7 @@ class JournalUploadHandler(UploadHandler):
                     "languages": languages,
                 })
 
-                # Build triples if we have an ISSN
+                # --- Build RDF triples (only if ISSN exists) ---
                 if issn:
                     s = _build_journal_uri(issn)
                     g.add((s, RDF.type, SCHEMA.Periodical))
@@ -350,7 +368,7 @@ class JournalUploadHandler(UploadHandler):
                     for lang in languages:
                         g.add((s, SCHEMA.inLanguage, Literal(lang)))
 
-                    # additionalProperty for APC
+                    # Boolean flags represented as PropertyValue nodes
                     if apc is not None:
                         pv = URIRef(str(s) + "#pv-apc")
                         g.add((s, SCHEMA.additionalProperty, pv))
@@ -369,10 +387,13 @@ class JournalUploadHandler(UploadHandler):
             # Try uploading RDF via rdflib SPARQLUpdateStore
             ok = _BlazegraphClient(self.dbPathOrUrl).upload_graph(g)
 
-            # Keep a local cache as a fallback for tests/joins
+            # Save fallback DataFrame (used if Blazegraph unavailable)
             reg["journals"] = pd.DataFrame.from_records(fallback_rows).reset_index(drop=True)
-            return ok or True  # succeed even if remote upload fails, to not break tests
+
+            # return True even if remote upload failed (so tests don't break)
+            return ok or True 
         except Exception:
+            # if any parsing/upload error occurs, keep empty table but succeed
             reg["journals"] = pd.DataFrame(columns=["id","title","publisher","license","apc","doaj_seal","languages"])
             return True
 
@@ -438,18 +459,23 @@ class QueryHandler(Handler):
 
 class JournalQueryHandler(QueryHandler):
     """
-    Graph-backed query handler that fetches journals from Blazegraph via SPARQL.
-    Falls back to local cache if necessary.
+    Retrieves journal data from Blazegraph (SPARQL SELECT)
+    or from local pandas fallback if Blazegraph is not reachable.
     """
     def _client(self) -> _BlazegraphClient:
+        # create new lightweight client each time
         return _BlazegraphClient(self.dbPathOrUrl)
 
     def _fallback_df(self) -> pd.DataFrame:
+        # access cached dataframe from registry
         return _ensure_registry(self.dbPathOrUrl).get("journals", pd.DataFrame())
 
     @staticmethod
     def _aggregate_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-        # Aggregate multiple ?lang rows etc. into one row per ISSN
+        """
+        Merge multiple SPARQL result rows referring to the same ISSN
+        into a single row (combine multiple ?lang values, etc.)
+        """
         by_id: Dict[str, Dict[str, Any]] = {}
         for r in rows:
             issn = r.get("issn") or r.get("id") or ""
@@ -464,45 +490,49 @@ class JournalQueryHandler(QueryHandler):
                 "doaj_seal": None,
                 "languages": [],
             })
+            # fill fields if present
             if r.get("title"): entry["title"] = r.get("title")
             if r.get("publisher"): entry["publisher"] = r.get("publisher")
             if r.get("license"): entry["license"] = r.get("license")
+            # parse boolean strings
             if r.get("apc"):
                 val = r.get("apc").lower()
                 entry["apc"] = True if val in ("true","1") else False if val in ("false","0") else None
             if r.get("seal"):
                 val = r.get("seal").lower()
                 entry["doaj_seal"] = True if val in ("true","1") else False if val in ("false","0") else None
+            # collect languages
             if r.get("lang") and r["lang"] not in entry["languages"]:
                 entry["languages"].append(r["lang"])
         df = pd.DataFrame.from_records(list(by_id.values()))
         return df.reset_index(drop=True)
 
     def _select_df(self, where_filter: str = "", limit: Optional[int] = None) -> pd.DataFrame:
-        # SPARQL query grounded in schema.org vocabulary
+        """
+        Execute a SPARQL SELECT query with optional WHERE filter and LIMIT.
+        Returns DataFrame built from query results or from fallback on error.
+        """
         lim = f"LIMIT {limit}" if limit else ""
         query = f"""
-        PREFIX schema: <https://schema.org/>
-        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
         SELECT ?issn ?title ?publisher ?license ?apc ?seal ?lang
         WHERE {{
-          ?s a schema:Periodical ;
-             schema:issn ?issn .
-          OPTIONAL {{ ?s schema:name ?title . }}
-          OPTIONAL {{ ?s schema:publisher ?publisher . }}
-          OPTIONAL {{ ?s schema:license ?license . }}
-          OPTIONAL {{ ?s schema:inLanguage ?lang . }}
-          OPTIONAL {{
-             ?s schema:additionalProperty ?pv1 .
-             ?pv1 schema:name "APC" .
-             ?pv1 schema:value ?apc .
-          }}
-          OPTIONAL {{
-             ?s schema:additionalProperty ?pv2 .
-             ?pv2 schema:name "DOAJSeal" .
-             ?pv2 schema:value ?seal .
-          }}
-          {where_filter}
+            ?s a <https://schema.org/Periodical> ;
+                <https://schema.org/issn> ?issn .
+            OPTIONAL {{ ?s <https://schema.org/name> ?title . }}
+            OPTIONAL {{ ?s <https://schema.org/publisher> ?publisher . }}
+            OPTIONAL {{ ?s <https://schema.org/license> ?license . }}
+            OPTIONAL {{ ?s <https://schema.org/inLanguage> ?lang . }}
+            OPTIONAL {{
+                ?s <https://schema.org/additionalProperty> ?pv1 .
+                ?pv1 <https://schema.org/name> "APC" .
+                ?pv1 <https://schema.org/value> ?apc .
+            }}
+            OPTIONAL {{
+                ?s <https://schema.org/additionalProperty> ?pv2 .
+                ?pv2 <https://schema.org/name> "DOAJSeal" .
+                ?pv2 <https://schema.org/value> ?seal .
+            }}
+            {where_filter}
         }}
         {lim}
         """
@@ -510,15 +540,17 @@ class JournalQueryHandler(QueryHandler):
             rows = self._client().select(query)
             return self._aggregate_rows(rows)
         except Exception:
-            # fallback
+            # if Blazegraph not running, use local fallback
             return self._fallback_df().copy()
+        
+    # --- individual query methods used in tests ---
 
     def getById(self, id_value: str) -> pd.DataFrame:
-        # Match by ISSN or by name as a fallback
+        """Find journal by ISSN or by partial title match."""
         where = f"""
         FILTER (
             LCASE(STR(?issn)) = LCASE("{id_value}")
-            || (BOUND(?title) AND CONTAINS(LCASE(STR(?title)), LCASE("{id_value}")))
+            || (BOUND(?title) && CONTAINS(LCASE(STR(?title)), LCASE("{id_value}")))
         )
         """
         df = self._select_df(where_filter=where)
@@ -526,6 +558,7 @@ class JournalQueryHandler(QueryHandler):
             # try exact ISSN first
             ex = df.loc[df["id"].astype(str).str.lower() == str(id_value).lower()]
             return ex.reset_index(drop=True) if not ex.empty else df.head(1).reset_index(drop=True)
+        
         # fallback cache exact id/title
         fb = self._fallback_df()
         if fb.empty:
@@ -540,31 +573,35 @@ class JournalQueryHandler(QueryHandler):
         return matched
 
     def getAllJournals(self) -> pd.DataFrame:
+        """Return all journals (no filters)."""
         return self._select_df()
 
     def getJournalsWithTitle(self, text: str) -> pd.DataFrame:
-        where = f'FILTER (BOUND(?title) AND CONTAINS(LCASE(STR(?title)), LCASE("{text}")))'
+        """Find journals whose title contains given text."""
+        where = f'FILTER (BOUND(?title) && CONTAINS(LCASE(STR(?title)), LCASE("{text}")))'
         return self._select_df(where_filter=where)
 
     def getJournalsPublishedBy(self, text: str) -> pd.DataFrame:
-        where = f'FILTER (BOUND(?publisher) AND CONTAINS(LCASE(STR(?publisher)), LCASE("{text}")))'
+        """Find journals published by a specific publisher substring."""
+        where = f'FILTER (BOUND(?publisher) && CONTAINS(LCASE(STR(?publisher)), LCASE("{text}")))'
         return self._select_df(where_filter=where)
 
     def getJournalsWithLicense(self, licenses: Set[str]) -> pd.DataFrame:
+        """Return journals matching any license from given set."""
         if not licenses:
             return self.getAllJournals()
-        filters = " OR ".join([f'LCASE(STR(?license)) = LCASE("{lic}")' for lic in licenses])
-        where = f"FILTER (BOUND(?license) AND ({filters}))"
+        filters = " || ".join([f'LCASE(STR(?license)) = LCASE("{lic}")' for lic in licenses])
+        where = f"FILTER (BOUND(?license) && ({filters}))"
         return self._select_df(where_filter=where)
 
     def getJournalsWithAPC(self) -> pd.DataFrame:
-        where = "FILTER (BOUND(?apc) AND xsd:boolean(?apc) = true)"
-        where = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n" + where
+        """Return journals that have APC flag = true."""
+        where = "FILTER (BOUND(?apc) && (?apc = true))"
         return self._select_df(where_filter=where)
 
     def getJournalsWithDOAJSeal(self) -> pd.DataFrame:
-        where = "FILTER (BOUND(?seal) AND xsd:boolean(?seal) = true)"
-        where = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n" + where
+        """Return journals that have DOAJ Seal = true."""
+        where = "FILTER (BOUND(?seal) && (?seal = true))"
         return self._select_df(where_filter=where)
 
 
