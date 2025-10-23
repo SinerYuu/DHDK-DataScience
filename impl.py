@@ -1,4 +1,3 @@
-
 from typing import List, Optional, Set, Dict, Any, Tuple
 from collections import OrderedDict
 import json
@@ -6,6 +5,8 @@ import sqlite3
 import os
 import re
 import pandas as pd
+import requests
+import traceback
 
 # --- rdflib / SPARQL ---
 from rdflib import Graph, Namespace, URIRef, Literal
@@ -229,42 +230,60 @@ def _build_journal_uri(issn: str) -> URIRef:
 
 class _BlazegraphClient:
     """
-    Minimal rdflib-powered client for Blazegraph.
-    Uses SPARQLUpdateStore for updates, SPARQLStore for selects.
+    Client for Blazegraph using direct HTTP POST for updates.
+    This avoids the BNode issues with SPARQLUpdateStore.
     """
     def __init__(self, endpoint: str):
         self.endpoint = endpoint
 
-    def _update_store(self) -> SPARQLUpdateStore:
-        store = SPARQLUpdateStore()
-        # Blazegraph usually supports the same endpoint for query and update
-        store.open((self.endpoint, self.endpoint))
-        return store
-
-    def _select_store(self) -> SPARQLStore:
-        return SPARQLStore(self.endpoint)
-
     def upload_graph(self, g: Graph) -> bool:
+        """Upload graph using SPARQL UPDATE via direct HTTP POST."""
         try:
-            store = self._update_store()
-            # Push triples directly via the store-connected Graph
-            G = Graph(store=store)
-            for t in g.triples((None, None, None)):
-                G.add(t)
-            return True
-        except Exception:
+            # Serialize graph to N-Triples format
+            triples_data = g.serialize(format='nt')
+            
+            # Create SPARQL INSERT DATA query
+            insert_query = f"INSERT DATA {{ {triples_data} }}"
+            
+            # POST to Blazegraph
+            response = requests.post(
+                self.endpoint,
+                data=insert_query,
+                headers={
+                    'Content-Type': 'application/sparql-update',
+                }
+            )
+            
+            if response.status_code in [200, 204]:
+                print(f"[OK] Successfully uploaded {len(g)} triples to Blazegraph")
+                return True
+            else:
+                print(f"[ERROR] Blazegraph returned status {response.status_code}: {response.text}")
+                return False
+                
+        except ImportError:
+            print("[ERROR] 'requests' library not installed. Install with: pip install requests")
+            return False
+        except Exception as e:
+            print(f"[ERROR] Failed to upload graph: {e}")
+            traceback.print_exc()
             return False
 
     def select(self, query: str) -> List[Dict[str, Any]]:
-        store = self._select_store()
-        g = Graph(store=store)
-        rows = []
-        for row in g.query(query):
-            binding = {}
-            for var, val in row.asdict().items():
-                binding[var] = str(val) if val is not None else None
-            rows.append(binding)
-        return rows
+        """Execute SPARQL SELECT query."""
+        try:
+            store = SPARQLStore(self.endpoint)
+            g = Graph(store=store)
+            rows = []
+            for row in g.query(query):
+                binding = {}
+                for var, val in row.asdict().items():
+                    binding[var] = str(val) if val is not None else None
+                rows.append(binding)
+            return rows
+        except Exception as e:
+            print(f"[ERROR] SPARQL query failed: {e}")
+            return []
 
 
 # -------------------- Uploaders --------------------
@@ -284,6 +303,7 @@ class JournalUploadHandler(UploadHandler):
             if not os.path.isfile(path) and os.path.isfile(os.path.join(".", path)):
                 path = os.path.join(".", path)
             if not os.path.isfile(path):
+                print(f"[WARNING] File not found: {path}")
                 # Keep empty table for fallback and succeed
                 reg["journals"] = pd.DataFrame(columns=["id","title","publisher","license","apc","doaj_seal","languages"])
                 return True
@@ -321,7 +341,7 @@ class JournalUploadHandler(UploadHandler):
                 apc = _bool_from_str(row[col_apc]) if col_apc else None
                 seal = _bool_from_str(row[col_seal]) if col_seal else None
                 langs_raw = str(row[col_lang]).strip() if col_lang else ""
-                languages = [l.strip() for l in langs_raw.split(",")] if langs_raw else []
+                languages = [l.strip() for l in langs_raw.split(", ")] if langs_raw else []
 
                 if not issn and not title:
                     continue
@@ -366,16 +386,18 @@ class JournalUploadHandler(UploadHandler):
                         g.add((pv2, RDF.type, SCHEMA.PropertyValue))
                         g.add((pv2, SCHEMA.name, Literal("DOAJSeal")))
                         g.add((pv2, SCHEMA.value, Literal(bool(seal), datatype=XSD.boolean)))
-
             # Try uploading RDF via rdflib SPARQLUpdateStore
             ok = _BlazegraphClient(self.dbPathOrUrl).upload_graph(g)
 
             # Keep a local cache as a fallback for tests/joins
             reg["journals"] = pd.DataFrame.from_records(fallback_rows).reset_index(drop=True)
-            return ok or True  # succeed even if remote upload fails, to not break tests
-        except Exception:
+
+            return ok
+        except Exception as e:
+            print(f"[ERROR] Exception in pushDataToDb: {e}")
+            traceback.print_exc()
             reg["journals"] = pd.DataFrame(columns=["id","title","publisher","license","apc","doaj_seal","languages"])
-            return True
+            return False
 
 
 class CategoryUploadHandler(UploadHandler):
@@ -509,34 +531,34 @@ class JournalQueryHandler(QueryHandler):
         # SPARQL query grounded in schema.org vocabulary
         lim = f"LIMIT {limit}" if limit else ""
         query = f"""
-        PREFIX schema: <https://schema.org/>
-        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
         SELECT ?issn ?title ?publisher ?license ?apc ?seal ?lang
         WHERE {{
-          ?s a schema:Periodical ;
-             schema:issn ?issn .
-          OPTIONAL {{ ?s schema:name ?title . }}
-          OPTIONAL {{ ?s schema:publisher ?publisher . }}
-          OPTIONAL {{ ?s schema:license ?license . }}
-          OPTIONAL {{ ?s schema:inLanguage ?lang . }}
-          OPTIONAL {{
-             ?s schema:additionalProperty ?pv1 .
-             ?pv1 schema:name "APC" .
-             ?pv1 schema:value ?apc .
-          }}
-          OPTIONAL {{
-             ?s schema:additionalProperty ?pv2 .
-             ?pv2 schema:name "DOAJSeal" .
-             ?pv2 schema:value ?seal .
-          }}
-          {where_filter}
+            ?s a <https://schema.org/Periodical> ;
+                <https://schema.org/issn> ?issn .
+            OPTIONAL {{ ?s <https://schema.org/name> ?title . }}
+            OPTIONAL {{ ?s <https://schema.org/publisher> ?publisher . }}
+            OPTIONAL {{ ?s <https://schema.org/license> ?license . }}
+            OPTIONAL {{ ?s <https://schema.org/inLanguage> ?lang . }}
+            OPTIONAL {{
+                ?s <https://schema.org/additionalProperty> ?pv1 .
+                ?pv1 <https://schema.org/name> "APC" .
+                ?pv1 <https://schema.org/value> ?apc .
+            }}
+            OPTIONAL {{
+                ?s <https://schema.org/additionalProperty> ?pv2 .
+                ?pv2 <https://schema.org/name> "DOAJSeal" .
+                ?pv2 <https://schema.org/value> ?seal .
+            }}
+            {where_filter}
         }}
         {lim}
         """
         try:
             rows = self._client().select(query)
-            return self._aggregate_rows(rows)
-        except Exception:
+            df = self._aggregate_rows(rows)
+            return df
+        except Exception as e:
+            traceback.print_exc()
             # fallback
             return self._fallback_df().copy()
 
@@ -545,7 +567,7 @@ class JournalQueryHandler(QueryHandler):
         where = f"""
         FILTER (
             LCASE(STR(?issn)) = LCASE("{id_value}")
-            || (BOUND(?title) AND CONTAINS(LCASE(STR(?title)), LCASE("{id_value}")))
+            || (BOUND(?title) && CONTAINS(LCASE(STR(?title)), LCASE("{id_value}")))
         )
         """
         df = self._select_df(where_filter=where)
@@ -570,28 +592,26 @@ class JournalQueryHandler(QueryHandler):
         return self._select_df()
 
     def getJournalsWithTitle(self, text: str) -> pd.DataFrame:
-        where = f'FILTER (BOUND(?title) AND CONTAINS(LCASE(STR(?title)), LCASE("{text}")))'
+        where = f'FILTER (BOUND(?title) && CONTAINS(LCASE(STR(?title)), LCASE("{text}")))'
         return self._select_df(where_filter=where)
 
     def getJournalsPublishedBy(self, text: str) -> pd.DataFrame:
-        where = f'FILTER (BOUND(?publisher) AND CONTAINS(LCASE(STR(?publisher)), LCASE("{text}")))'
+        where = f'FILTER (BOUND(?publisher) && CONTAINS(LCASE(STR(?publisher)), LCASE("{text}")))'
         return self._select_df(where_filter=where)
 
     def getJournalsWithLicense(self, licenses: Set[str]) -> pd.DataFrame:
         if not licenses:
             return self.getAllJournals()
-        filters = " OR ".join([f'LCASE(STR(?license)) = LCASE("{lic}")' for lic in licenses])
-        where = f"FILTER (BOUND(?license) AND ({filters}))"
+        filters = " || ".join([f'LCASE(STR(?license)) = LCASE("{lic}")' for lic in licenses])
+        where = f"FILTER (BOUND(?license) && ({filters}))"
         return self._select_df(where_filter=where)
 
     def getJournalsWithAPC(self) -> pd.DataFrame:
-        where = "FILTER (BOUND(?apc) AND xsd:boolean(?apc) = true)"
-        where = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n" + where
+        where = "FILTER (BOUND(?apc) && (?apc = true))"
         return self._select_df(where_filter=where)
 
     def getJournalsWithDOAJSeal(self) -> pd.DataFrame:
-        where = "FILTER (BOUND(?seal) AND xsd:boolean(?seal) = true)"
-        where = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n" + where
+        where = "FILTER (BOUND(?seal) && (?seal = true))"
         return self._select_df(where_filter=where)
 
 
@@ -996,4 +1016,3 @@ class FullQueryEngine(BasicQueryEngine):
 
         final = final.drop_duplicates(subset=["id"]).reset_index(drop=True)
         return self._journals_from_df(final)
-
