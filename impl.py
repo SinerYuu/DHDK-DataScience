@@ -966,29 +966,62 @@ class FullQueryEngine(BasicQueryEngine):
         ldf = self._links_df()
         if jdf.empty or ldf.empty:
             return []
-        #Category mask
-        #
+        
+        # Category mask
+        # If 'categories' is empty, keep all rows with a non-null category.
+        # Otherwise, keep rows whose category value is inside the provided set.
         cat_mask = ldf["category"].notna() if not categories else ldf["category"].isin(categories)
+        
+        # Quartile mask
+        # If 'quartiles' is empty, keep all rows (including missing ones).
+        # Otherwise, convert to uppercase and compare (case-insensitive).
         q_mask = (ldf["quartile"].notna() | ldf["quartile"].isna()) if not quartiles else ldf["quartile"].astype(str).str.upper().isin({q.upper() for q in quartiles})
-        lsub = ldf.loc[cat_mask & q_mask]
+        
+        # Combine both masks, keeps only rows that satisfy BOTH conditions
+        lsub = ldf.loc[cat_mask & q_mask] 
+        
+        # Join filtered links with journal table on ID/ISSN
         joined = self._join_on_ids(jdf, lsub)
+
+        # Drop duplicate journal IDs to avoid multiple matches
         joined = joined.drop_duplicates(subset=["id"]).reset_index(drop=True)
         return self._journals_from_df(joined)
 
     def getJournalsInAreasWithLicense(self, areas: Set[str], licenses: Set[str]) -> List[Journal]:
+        """
+        Return journals belonging to specific areas and having the specified license type.
+        """
         jdf = self._journal_df()
         ldf = self._links_df()
         if jdf.empty or ldf.empty:
             return []
+        
+        # Area mask
+        # If 'areas' is empty, keep all non-null rows.
+        # Otherwise, keep rows whose 'area' matches one of the specified values.
         area_mask = ldf["area"].notna() if not areas else ldf["area"].isin(areas)
+
+        # Filter the link table using the mask
         lsub = ldf.loc[area_mask]
+
+        # Join filtered links with journal table on ID/ISSN
         joined = self._join_on_ids(jdf, lsub)
+        
+        # Additional license filtering (case-insensitive)
         if licenses and "license" in joined.columns:
             joined = joined.loc[joined["license"].astype(str).str.lower().isin({x.lower() for x in licenses})]
+        
+        # Remove duplicates by journal ID and convert to Journal objects
         joined = joined.drop_duplicates(subset=["id"]).reset_index(drop=True)
         return self._journals_from_df(joined)
 
     def getDiamondJournalsInAreasAndCategoriesWithQuartile(self, areas: Set[str], categories: Set[str], quartiles: Set[str]) -> List[Journal]:
+        """
+        Return journals that:
+        - belong to the given areas
+        - belong to the given categories and quartiles
+        - have no APC fee (Diamond Open Access)
+        """
         jdf = self._journal_df()
         ldf = self._links_df()
         if jdf.empty or ldf.empty:
@@ -1001,16 +1034,19 @@ class FullQueryEngine(BasicQueryEngine):
         j_area = self._join_on_ids(jdf, ldf.loc[area_mask])
         j_catq = self._join_on_ids(jdf, ldf.loc[cat_mask & q_mask])
 
-        # Safely handle cases where columns might be missing
+        # Get unique journal IDs from each subset
         ids_area = set(j_area["id"].unique()) if "id" in j_area.columns else set()
         ids_catq = set(j_catq["id"].unique()) if "id" in j_catq.columns else set()
 
+        # Keep only IDs that appear in BOTH sets (intersection)
         ok_ids = ids_area.intersection(ids_catq)
         if not ok_ids:
             return []
 
+        # Extract matching journals from the main journal table
         final = jdf.loc[jdf["id"].isin(ok_ids)].copy()
 
+        # Keep only journals where APC == False (no author fees)
         if "apc" in final.columns:
             final = final.loc[final["apc"] == False]
 
