@@ -289,283 +289,103 @@ class Journal(IdentifiableEntity):
 
 # -------------------- Basic Handlers (upload + query) --------------------
 
-#the parent of all handler types
+# -------------------- Basic Handlers (upload + query) --------------------
+
+# The parent class for all handler types.
 class Handler:
     def __init__(self):
-        self.dbPathOrUrl: str = ""
+        self.dbPathOrUrl: str = ""  # Initialize the database path or URL.
 
     def getDbPathOrUrl(self) -> str:
-        return self.dbPathOrUrl
+        return self.dbPathOrUrl  # Return the current database path or URL.
 
     def setDbPathOrUrl(self, val: str) -> bool:
-        self.dbPathOrUrl = val
-        _ensure_registry(val)  # make sure registry exists
-        return True
+        self.dbPathOrUrl = val  # Set the database path or URL.
+        _ensure_registry(val)  # Ensure registry exists for the new path.
+        return True  # Return True indicating the operation succeeded.
 
-#abstract subclass for data ingestion
+# Abstract subclass for data ingestion (uploading data).
 class UploadHandler(Handler):
-    def pushDataToDb(self, file_path: str) -> bool:  # must be overridden by specific uploaders
-        raise NotImplementedError()  # if someone forgets to override it
+    def pushDataToDb(self, file_path: str) -> bool:  # Must be implemented by specific uploaders.
+        raise NotImplementedError()  # Raise an error if not overridden.
 
-#abstract subclass for data retrieval
+# Abstract subclass for data retrieval (querying data).
 class QueryHandler(Handler):
-    def getById(self, id: str) -> pd.DataFrame: 
-        raise NotImplementedError
+    def getById(self, id: str) -> pd.DataFrame:  # Must be implemented by subclasses.
+        raise NotImplementedError()  # Raise an error if not overridden.
 
 # -------------------- Graph/Blazegraph helpers --------------------
 
-SCHEMA = Namespace("https://schema.org/")
+SCHEMA = Namespace("https://schema.org/")  # Define the schema namespace.
 
 def _bool_from_str(v: Any) -> Optional[bool]:
-    if isinstance(v, bool):
+    if isinstance(v, bool):  # If value is already a boolean, return it.
         return v
-    if isinstance(v, str):
+    if isinstance(v, str):  # If value is a string, parse it into a boolean.
         w = v.strip().lower()
-        if w in {"true","yes","y","1"}: return True
-        if w in {"false","no","n","0"}: return False
-    return None
+        if w in {"true", "yes", "y", "1"}: return True
+        if w in {"false", "no", "n", "0"}: return False
+    return None  # Return None if the string is not valid.
 
 def _build_journal_uri(issn: str) -> URIRef:
-    """
-    Constructs a stable URI (Uniform Resource Identifier) for a journal resource in RDF.
-    
-    URI Format: http://example.org/periodical/{issn}
-    
-    Why URIs are needed:
-    - RDF (Resource Description Framework) represents data as triples: (subject, predicate, object)
-    - Each subject (like a journal) needs a unique URI identifier
-    - URIs enable linking between different knowledge bases
-    - The ISSN is used as the stable identifier since it's unique per journal
-    
-    Example URI: http://example.org/periodical/1542-4863 (for a specific journal)
-    
-    This URI will be used as the subject in RDF triples stored in Blazegraph.
-    """
+    # Constructs a URI for a journal using its ISSN.
     return URIRef(f"http://example.org/periodical/{issn}")
 
-
 class _BlazegraphClient:
-    """
-    HTTP Client for communicating with Blazegraph (an RDF/SPARQL database).
-    
-    What is Blazegraph?
-    - Blazegraph is a high-performance RDF (Resource Description Framework) database
-    - It stores semantic data in the form of triples: (subject, predicate, object)
-    - It supports SPARQL queries (like SQL but for RDF data)
-    - Runs as a web service with HTTP endpoints
-    
-    What is RDF?
-    - Resource Description Framework for structured data
-    - Everything is represented as triples: Subject -> Predicate -> Object
-    - Example: "Nature Journal" (subject) "hasLicense" (predicate) "CC BY" (object)
-    - Enables linked data and semantic relationships
-    
-    This client provides two main operations:
-    1. upload_graph() - Insert journal data as RDF triples
-    2. select() - Query data using SPARQL language
-    
-    Alternative considered: SPARQLUpdateStore from rdflib
-    - Direct HTTP POST is used to avoid BNode (blank node) serialization issues
-    - More reliable for inserting large datasets
-    """
-    
     def __init__(self, endpoint: str):
-        """
-        Initialize the Blazegraph client.
-        
-        Args:
-            endpoint: HTTP URL to the Blazegraph SPARQL endpoint
-            Example: "http://127.0.0.1:9999/blazegraph/sparql"
-        """
-        self.endpoint = endpoint
+        self.endpoint = endpoint  # Set the Blazegraph endpoint URL.
 
     def upload_graph(self, g: Graph) -> bool:
-        """
-        Upload an RDF Graph to Blazegraph using SPARQL INSERT DATA.
-        
-        Process:
-        1. Serialize the RDF graph to N-Triples format (one triple per line)
-        2. Wrap it in a SPARQL INSERT DATA statement
-        3. POST to Blazegraph endpoint
-        
-        Example RDF triple (for a journal):
-        <http://example.org/periodical/1542-4863> <https://schema.org/issn> "1542-4863" .
-        
-        Args:
-            g: rdflib Graph object containing RDF triples to upload
-            
-        Returns:
-            True if upload succeeds (HTTP 200 or 204), False otherwise
-            
-        Failure modes:
-        - Network error: Blazegraph server not running or unreachable
-        - HTTP error: Invalid SPARQL syntax or server error
-        - In all cases, system falls back to local cache
-        """
         try:
-            # Serialize graph to N-Triples format (standard RDF line-based format)
-            # Each line is one triple: <subject> <predicate> <object> .
-            triples_data = g.serialize(format='nt')
+            triples_data = g.serialize(format='nt')  # Serialize RDF graph to N-Triples format.
+            insert_query = f"INSERT DATA {{ {triples_data} }}"  # Create SPARQL insert query.
+            response = requests.post(self.endpoint, data=insert_query, headers={'Content-Type': 'application/sparql-update'})  # Send query to Blazegraph.
             
-            # Create SPARQL UPDATE query to insert all triples
-            # SPARQL UPDATE is similar to SQL INSERT but for RDF
-            insert_query = f"INSERT DATA {{ {triples_data} }}"
-            
-            # POST to Blazegraph SPARQL endpoint
-            # Content-Type: application/sparql-update tells server to parse as SPARQL UPDATE
-            response = requests.post(
-                self.endpoint,
-                data=insert_query,
-                headers={
-                    'Content-Type': 'application/sparql-update',
-                }
-            )
-            
-            # Blazegraph returns 200 (OK) or 204 (No Content) for successful inserts
+            # Check if the upload was successful (HTTP status 200 or 204).
             if response.status_code in [200, 204]:
-                print(f"[OK] Successfully uploaded {len(g)} triples to Blazegraph")
+                print(f"[OK] Successfully uploaded {len(g)} triples.")
                 return True
             else:
                 print(f"[ERROR] Blazegraph returned status {response.status_code}: {response.text}")
                 return False
-                
-        except ImportError:
-            print("[ERROR] 'requests' library not installed. Install with: pip install requests")
-            return False
         except Exception as e:
             print(f"[ERROR] Failed to upload graph: {e}")
-            traceback.print_exc()
             return False
 
     def select(self, query: str) -> List[Dict[str, Any]]:
-        """
-        Execute a SPARQL SELECT query against Blazegraph.
-        
-        SPARQL (SPARQL Protocol and RDF Query Language):
-        - SQL-like query language for RDF data
-        - Use SELECT to retrieve data matching patterns
-        - Use WHERE clause to specify triple patterns to match
-        
-        Query structure:
-        SELECT ?variable1 ?variable2
-        WHERE {
-            ?variable1 <predicate1> ?variable2 .
-            ?variable1 <predicate2> ?value .
-            FILTER (conditions)
-            OPTIONAL { additional patterns }
-        }
-        
-        Example query for finding journals with CC BY license:
-        SELECT ?issn ?title
-        WHERE {
-            ?journal a <https://schema.org/Periodical> ;
-                     <https://schema.org/issn> ?issn ;
-                     <https://schema.org/name> ?title ;
-                     <https://schema.org/license> ?license .
-            FILTER (?license = "CC BY")
-        }
-        
-        Args:
-            query: SPARQL SELECT query string
-            
-        Returns:
-            List of dictionaries, each representing one result row
-            Example: [{'issn': '1542-4863', 'title': 'Nature'}, ...]
-            
-        Exception handling:
-        - Returns empty list if query fails
-        - System continues with fallback cache
-        """
         try:
-            # Connect to Blazegraph using SPARQLStore from rdflib
-            store = SPARQLStore(self.endpoint)
-            g = Graph(store=store)
-            
+            store = SPARQLStore(self.endpoint)  # Connect to Blazegraph using SPARQL store.
+            g = Graph(store=store)  # Create an RDF graph using the SPARQL store.
             rows = []
-            # Execute query and iterate over results
+
+            # Execute the SPARQL query and store the results.
             for row in g.query(query):
                 binding = {}
-                # Convert each result variable to string
                 for var, val in row.asdict().items():
                     binding[var] = str(val) if val is not None else None
                 rows.append(binding)
             return rows
         except Exception as e:
             print(f"[ERROR] SPARQL query failed: {e}")
-            return []
-
+            return []  # Return an empty list if the query fails.
 
 # -------------------- Uploaders --------------------
 
 class JournalUploadHandler(UploadHandler):
-    """
-    Loads DOAJ (Directory of Open Access Journals) CSV data and publishes it as RDF.
-    
-    Data Pipeline:
-    1. Read DOAJ CSV file (contains journal metadata: ISSN, title, publisher, etc.)
-    2. Parse and normalize the data
-    3. Convert to RDF triples using schema.org vocabulary
-    4. Upload RDF triples to Blazegraph for semantic querying
-    5. Keep local cache as fallback
-    
-    RDF Schema Used (schema.org):
-    - Class: schema:Periodical (represents a journal/periodical publication)
-    - Properties:
-        * schema:issn - International Standard Serial Number (unique identifier)
-        * schema:name - Journal title
-        * schema:publisher - Publishing organization
-        * schema:license - Open access license
-        * schema:inLanguage - Manuscript languages
-        * schema:additionalProperty - Custom properties (APC, DOAJ Seal)
-    
-    Why RDF/Blazegraph?
-    - Enables semantic queries across multiple data sources
-    - Allows linking journals to categories and areas
-    - Supports SPARQL queries for complex filtering
-    
-    Fallback Strategy:
-    - Even if Blazegraph upload fails, journals are cached locally
-    - Queries fall back to cached data automatically
-    - System remains functional without external database
-    """
-    
     def pushDataToDb(self, file_path: str) -> bool:
-        """
-        Upload DOAJ journal data to Blazegraph as RDF triples.
-        
-        Process:
-        1. Read CSV file with flexible column detection
-        2. Parse each journal row
-        3. Create RDF triples for each journal
-        4. Handle special properties (APC, DOAJ Seal) as PropertyValues
-        5. Upload to Blazegraph
-        6. Cache data locally as fallback
-        
-        Args:
-            file_path: Path to DOAJ CSV file
-            
-        Returns:
-            True if Blazegraph upload succeeds, False otherwise
-            (But data is cached regardless)
-        """
-        reg = _ensure_registry(self.dbPathOrUrl)
+        reg = _ensure_registry(self.dbPathOrUrl)  # Ensure registry is set.
         try:
-            # Resolve file path
-            path = file_path
+            path = file_path  # Set the file path.
             if not os.path.isfile(path) and os.path.isfile(os.path.join(".", path)):
-                path = os.path.join(".", path)
-            if not os.path.isfile(path):
+                path = os.path.join(".", path)  # Resolve relative file paths.
+            if not os.path.isfile(path):  # Check if the file exists.
                 print(f"[WARNING] File not found: {path}")
-                # Keep empty table for fallback and succeed
                 reg["journals"] = pd.DataFrame(columns=["id","title","publisher","license","apc","doaj_seal","languages"])
-                return True
+                return True  # Return success even if file is missing.
 
-            # Read CSV file - don't treat empty values as NaN to preserve empty strings
-            df_raw = pd.read_csv(path, dtype=str, keep_default_na=False)
+            df_raw = pd.read_csv(path, dtype=str, keep_default_na=False)  # Read CSV file as strings.
 
-            # Flexible column mapping (case-insensitive) to handle different CSV formats
-            # Different sources may use different column names
-            cols_lower = {c.lower(): c for c in df_raw.columns}
+            cols_lower = {c.lower(): c for c in df_raw.columns}  # Normalize column names to lowercase.
             def pick(*keys):
                 """Find column name by checking multiple possible names."""
                 for k in keys:
@@ -574,7 +394,7 @@ class JournalUploadHandler(UploadHandler):
                             return orig
                 return None
 
-            # Map column names to standardized fields
+            # Map columns to standardized fields.
             col_issn = pick("issn", "eissn", "pissn", "journal id", "identifier")
             col_title = pick("title")
             col_publisher = pick("publisher")
@@ -583,15 +403,14 @@ class JournalUploadHandler(UploadHandler):
             col_seal = pick("seal", "doaj")
             col_lang = pick("language")
 
-            # Build RDF graph - will be uploaded to Blazegraph
+            # Build RDF graph.
             g = Graph()
-            g.bind("schema", SCHEMA)  # Bind schema.org namespace prefix
+            g.bind("schema", SCHEMA)  # Bind schema.org prefix.
 
-            fallback_rows = []
+            fallback_rows = []  # List to store rows for local cache.
 
-            # Process each journal row
             for _, row in df_raw.iterrows():
-                # Extract and normalize fields
+                # Extract and normalize each journal's data.
                 issn = (str(row[col_issn]).strip() if col_issn and str(row[col_issn]).strip() else "")
                 title = str(row[col_title]).strip() if col_title else ""
                 publisher = str(row[col_publisher]).strip() if col_publisher else ""
@@ -601,13 +420,13 @@ class JournalUploadHandler(UploadHandler):
                 langs_raw = str(row[col_lang]).strip() if col_lang else ""
                 languages = [l.strip() for l in langs_raw.split(", ")] if langs_raw else []
 
-                # Skip rows with no identifier (ISSN or title)
+                # Skip rows with missing data (ISSN or title).
                 if not issn and not title:
                     continue
 
-                # Create local cache row (used if Blazegraph unavailable)
+                # Add row to fallback cache.
                 fallback_rows.append({
-                    "id": issn or title,  # Use ISSN as primary ID, fall back to title
+                    "id": issn or title,  # Use ISSN as primary ID.
                     "title": title,
                     "publisher": publisher,
                     "license": license_,
@@ -616,29 +435,20 @@ class JournalUploadHandler(UploadHandler):
                     "languages": languages,
                 })
 
-                # Build RDF triples only if we have an ISSN (required for Blazegraph)
-                if issn:
-                    # Create subject URI for this journal
-                    s = _build_journal_uri(issn)
-                    
-                    # Add RDF type (this is a Periodical)
-                    g.add((s, RDF.type, SCHEMA.Periodical))
-                    
-                    # Add basic properties
-                    g.add((s, SCHEMA.issn, Literal(issn)))
+                if issn:  # Only process if ISSN is available.
+                    s = _build_journal_uri(issn)  # Build URI for the journal.
+                    g.add((s, RDF.type, SCHEMA.Periodical))  # Add type (journal).
+                    g.add((s, SCHEMA.issn, Literal(issn)))  # Add ISSN property.
                     if title:
-                        g.add((s, SCHEMA.name, Literal(title)))
+                        g.add((s, SCHEMA.name, Literal(title)))  # Add title property.
                     if publisher:
-                        g.add((s, SCHEMA.publisher, Literal(publisher)))
+                        g.add((s, SCHEMA.publisher, Literal(publisher)))  # Add publisher property.
                     if license_:
-                        g.add((s, SCHEMA.license, Literal(license_)))
-                    
-                    # Add languages (journal accepts multiple languages)
+                        g.add((s, SCHEMA.license, Literal(license_)))  # Add license property.
                     for lang in languages:
-                        g.add((s, SCHEMA.inLanguage, Literal(lang)))
+                        g.add((s, SCHEMA.inLanguage, Literal(lang)))  # Add language property.
 
-                    # Add APC as a PropertyValue (schema.org pattern for complex properties)
-                    # PropertyValue: name "APC", value true/false
+                    # Add additional properties (APC and DOAJ Seal).
                     if apc is not None:
                         pv = URIRef(str(s) + "#pv-apc")
                         g.add((s, SCHEMA.additionalProperty, pv))
@@ -646,29 +456,24 @@ class JournalUploadHandler(UploadHandler):
                         g.add((pv, SCHEMA.name, Literal("APC")))
                         g.add((pv, SCHEMA.value, Literal(bool(apc), datatype=XSD.boolean)))
 
-                    # Add DOAJ Seal as a PropertyValue (similar pattern)
                     if seal is not None:
                         pv2 = URIRef(str(s) + "#pv-doaj-seal")
                         g.add((s, SCHEMA.additionalProperty, pv2))
                         g.add((pv2, RDF.type, SCHEMA.PropertyValue))
                         g.add((pv2, SCHEMA.name, Literal("DOAJSeal")))
                         g.add((pv2, SCHEMA.value, Literal(bool(seal), datatype=XSD.boolean)))
-            
-            # Try uploading RDF graph to Blazegraph
-            ok = _BlazegraphClient(self.dbPathOrUrl).upload_graph(g)
 
-            # Keep local cache regardless of upload success
-            # This ensures queries work even if Blazegraph is unavailable
+            ok = _BlazegraphClient(self.dbPathOrUrl).upload_graph(g)  # Upload RDF graph.
+
+            # Cache the data locally regardless of upload success.
             reg["journals"] = pd.DataFrame.from_records(fallback_rows).reset_index(drop=True)
 
             return ok
         except Exception as e:
             print(f"[ERROR] Exception in pushDataToDb: {e}")
-            traceback.print_exc()
             reg["journals"] = pd.DataFrame(columns=["id","title","publisher","license","apc","doaj_seal","languages"])
-            return False
-
-
+            return False  # Return failure on exception.
+            
 class CategoryUploadHandler(UploadHandler):
     """
     Handles loading SCImago-like JSON data into a relational (SQLite) database.
