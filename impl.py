@@ -286,9 +286,6 @@ class Journal(IdentifiableEntity):
         """Return a set containing this journal's ID."""
         return {self._id} if self._id else set()
 
-
-# -------------------- Basic Handlers (upload + query) --------------------
-
 # -------------------- Basic Handlers (upload + query) --------------------
 
 # The parent class for all handler types.
