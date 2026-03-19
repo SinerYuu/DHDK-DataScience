@@ -429,78 +429,86 @@ class JournalUploadHandler(UploadHandler):
             return False
 
 
-class CategoryUploadHandler:
-    def __init__(self, db_path: str):
-        # The attribute name should match the one used in the query handler
-        self.dbPathOrUrl = db_path
+class CategoryUploadHandler(UploadHandler):
+    """
+    Reads a SCImago JSON file and writes categories, areas, and
+    journal–category–area links to both SQLite and the in-memory registry.
+    """
 
     def pushDataToDb(self, file_path: str) -> bool:
-        # Check if the input file exists on the disk
-        if not os.path.exists(file_path):
-            return False
+        reg = _ensure_registry(self.dbPathOrUrl)
+        db_path = self.dbPathOrUrl
+        path = file_path
+
+        if not os.path.isfile(path) and os.path.isfile(os.path.join(".", path)):
+            path = os.path.join(".", path)
+
+        empty_cats  = pd.DataFrame(columns=["id", "quartile"])
+        empty_areas = pd.DataFrame(columns=["id"])
+        empty_links = pd.DataFrame(columns=["issn", "category", "quartile", "area"])
+
+        if not os.path.isfile(path):
+            print(f"[WARNING] Category file not found: {path}. "
+                  "Initialising empty category tables.")
+            reg["categories"] = empty_cats
+            reg["areas"]      = empty_areas
+            reg["links"]      = empty_links
+            try:
+                conn = sqlite3.connect(db_path)
+                empty_cats.to_sql("categories",  conn, if_exists="replace", index=False)
+                empty_areas.to_sql("areas",      conn, if_exists="replace", index=False)
+                empty_links.to_sql("links",      conn, if_exists="replace", index=False)
+                conn.close()
+            except Exception as e:
+                print(f"[ERROR] Could not create empty SQLite tables: {e}")
+            return False  # Nothing loaded
 
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
             cat_rows, area_rows, link_rows = [], [], []
 
             for entry in data:
-                # Extract identifiers, categories, and areas as defined in the data model
-                idents = entry.get("identifiers", [])
+                idents     = entry.get("identifiers", [])
                 categories = entry.get("categories", [])
-                areas = entry.get("areas", [])
+                areas      = entry.get("areas", [])
 
-                # 1. Process and normalize Area entities (unique identifiers)
-                current_areas = [str(a).strip() for a in areas if str(a).strip()]
-                for aid in current_areas:
-                    area_rows.append({"id": aid})
-
-                # 2. Process Categories and establish direct relations
                 for cat in categories:
-                    # Clean the unique identifier (ID) and attribute (Quartile)
-                    cid = str(cat.get("id", "")).strip()
-                    quart = str(cat.get("quartile", "")).strip()
-                    
-                    if not cid:
-                        continue
-                    
-                    # Store the category entity with its intrinsic attribute
-                    cat_rows.append({"id": cid, "quartile": quart})
+                    cid   = str(cat.get("id", "")).strip()
+                    quart = str(cat.get("quartile", "")).strip() or None
+                    if cid:
+                        cat_rows.append({"id": cid, "quartile": quart})
+                        for issn in idents:
+                            link_rows.append(
+                                {"issn": issn, "category": cid, "quartile": quart, "area": None}
+                            )
 
-                    # CORE LOGIC: Create direct horizontal relations between Category and Area.
-                    # This follows the 'Combining Tables' principle from the slides.
-                    issn_list = idents if idents else [None]
-                    for issn in issn_list:
-                        if current_areas:
-                            for aid in current_areas:
-                                link_rows.append({
-                                    "issn": issn, 
-                                    "category": cid, 
-                                    "area": aid, 
-                                    "quartile": quart
-                                })
-                        else:
-                            # Handle cases where a category has no associated research area
-                            link_rows.append({
-                                "issn": issn, 
-                                "category": cid, 
-                                "area": None, 
-                                "quartile": quart
-                            })
+                for ar in areas:
+                    aid = str(ar).strip()
+                    if aid:
+                        area_rows.append({"id": aid})
+                        for issn in idents:
+                            link_rows.append(
+                                {"issn": issn, "category": None, "quartile": None, "area": aid}
+                            )
 
-            # Connect to SQLite and persist data using relational tables
-            conn = sqlite3.connect(self.dbPathOrUrl)
-            
-            # Use drop_duplicates to ensure entity uniqueness as per PPT 2
-            pd.DataFrame(cat_rows).drop_duplicates().to_sql("categories", conn, if_exists="replace", index=False)
-            pd.DataFrame(area_rows).drop_duplicates().to_sql("areas", conn, if_exists="replace", index=False)
-            pd.DataFrame(link_rows).drop_duplicates().to_sql("links", conn, if_exists="replace", index=False)
-            
+            reg["categories"] = pd.DataFrame.from_records(cat_rows).drop_duplicates().reset_index(drop=True)
+            reg["areas"]      = pd.DataFrame.from_records(area_rows).drop_duplicates().reset_index(drop=True)
+            reg["links"]      = pd.DataFrame.from_records(link_rows).drop_duplicates().reset_index(drop=True)
+
+            conn = sqlite3.connect(db_path)
+            reg["categories"].to_sql("categories", conn, if_exists="replace", index=False)
+            reg["areas"].to_sql("areas",           conn, if_exists="replace", index=False)
+            reg["links"].to_sql("links",           conn, if_exists="replace", index=False)
             conn.close()
+
+            print(f"[OK] Category data successfully stored in {db_path}")
             return True
+
         except Exception as e:
-            print(f"Error during upload: {e}")
+            print(f"[ERROR] Failed to process {file_path}: {e}")
+            traceback.print_exc()
             return False
 
 
@@ -619,7 +627,7 @@ class JournalQueryHandler(QueryHandler):
         # expressions depending on the version. Using the explicit XSD type
         # is the safest and most portable form.
         lim = f"LIMIT {limit}" if limit else ""
-        query = f
+        query = f"""
         PREFIX schema: <https://schema.org/>
         PREFIX xsd:    <http://www.w3.org/2001/XMLSchema#>
 
@@ -660,7 +668,7 @@ class JournalQueryHandler(QueryHandler):
             LCASE(STR(?issn)) = LCASE("{id_value}")
             || (BOUND(?title) && CONTAINS(LCASE(STR(?title)), LCASE("{id_value}")))
         )
-    
+        """
         df = self._select_df(where_filter=where)
         if not df.empty:
             ex = df.loc[df["id"].astype(str).str.lower() == str(id_value).lower()]
@@ -709,75 +717,120 @@ class JournalQueryHandler(QueryHandler):
         return self._select_df(where_filter=where)
 
 
-class CategoryQueryHandler:
-    def __init__(self, db_path: str):
-        self.dbPathOrUrl = db_path
+class CategoryQueryHandler(QueryHandler):
+    """
+    Queries category and area data from SQLite, with in-memory registry
+    as a fallback when the database file is unavailable.
+    """
 
-    def _get_df(self, table: str) -> pd.DataFrame:
-        """Internal helper to read a SQL table into a Pandas DataFrame"""
+    def _reg(self) -> Dict[str, Any]:
+        return _ensure_registry(self.dbPathOrUrl)
+
+    def _df_cat(self) -> pd.DataFrame:
         try:
-            with sqlite3.connect(self.dbPathOrUrl) as conn:
-                return pd.read_sql_query(f"SELECT * FROM {table}", conn)
+            conn = sqlite3.connect(self.dbPathOrUrl)
+            df = pd.read_sql_query("SELECT * FROM categories", conn)
+            conn.close()
+            return df
         except Exception:
-            return pd.DataFrame()
+            return self._reg().get("categories", pd.DataFrame())
 
-    def getAllCategories(self) -> List:
-        """Requirement: Return a list of Category objects, not a DataFrame"""
-        df = self._get_df("categories")
-        if df.empty: return []
-        # Convert each unique ID from the table into a Category class instance
-        return [Category(id=str(cid)) for cid in df['id'].unique()]
+    def _df_area(self) -> pd.DataFrame:
+        try:
+            conn = sqlite3.connect(self.dbPathOrUrl)
+            df = pd.read_sql_query("SELECT * FROM areas", conn)
+            conn.close()
+            return df
+        except Exception:
+            return self._reg().get("areas", pd.DataFrame())
 
-    def getAllAreas(self) -> List:
-        """Requirement: Return a list of Area objects"""
-        df = self._get_df("areas")
-        if df.empty: return []
-        return [Area(id=str(aid)) for aid in df['id'].unique()]
+    def _df_links(self) -> pd.DataFrame:
+        try:
+            conn = sqlite3.connect(self.dbPathOrUrl)
+            df = pd.read_sql_query("SELECT * FROM links", conn)
+            conn.close()
+            return df
+        except Exception:
+            return self._reg().get("links", pd.DataFrame())
 
-    def getEntityById(self, id_value: str):
-        """Standard identifier matching handling case-insensitivity and whitespace"""
-        id_clean = str(id_value).strip().lower()
-        
-        # Search in Categories
-        dfc = self._get_df("categories")
+    def getById(self, id_value: str) -> pd.DataFrame:
+        dfc = self._df_cat()
+        dfa = self._df_area()
+        out = []
         if not dfc.empty:
-            match = dfc[dfc['id'].str.lower() == id_clean]
-            if not match.empty:
-                return Category(id=str(match.iloc[0]['id']))
-        
-        # Search in Areas
-        dfa = self._get_df("areas")
+            out.append(dfc.loc[dfc["id"].astype(str) == str(id_value)])
         if not dfa.empty:
-            match = dfa[dfa['id'].str.lower() == id_clean]
-            if not match.empty:
-                return Area(id=str(match.iloc[0]['id']))
-        
-        # Robustness: Return an empty Category instance if no match is found
-        return Category(id="")
+            out.append(dfa.loc[dfa["id"].astype(str) == str(id_value)])
+        if out:
+            return pd.concat(out, ignore_index=True)
+        return pd.DataFrame(columns=["id"])
 
-    def getCategoriesAssignedToAreas(self, areas_set: Set[str]) -> List:
-        """Filter the 'links' table to find categories related to specific areas"""
-        df_links = self._get_df("links")
-        if df_links.empty: return []
-        
-        # Normalize search terms to ensure matching consistency
-        areas_lower = [a.lower() for a in areas_set]
-        mask = df_links['area'].str.lower().isin(areas_lower)
-        
-        # Extract related Category IDs and instantiate them
-        matched_ids = df_links.loc[mask, 'category'].dropna().unique()
-        return [Category(id=str(cid)) for cid in matched_ids]
+    def getAllCategories(self) -> pd.DataFrame:
+        return self._df_cat().drop_duplicates(subset=["id"]).reset_index(drop=True)
 
-    def getAreasAssignedToCategories(self, categories_set: Set[str]) -> List:
-        """Reverse lookup: Find areas related to specific categories using the link table"""
-        df_links = self._get_df("links")
-        if df_links.empty: return []
-        
-        cats_lower = [c.lower() for c in categories_set]
-        mask = df_links['category'].str.lower().isin(cats_lower)
-        
-        matched_ids = df_links.loc[mask, 'area'].dropna().unique()
-        return [Area(id=str(aid)) for aid in matched_ids]
+    def getAllAreas(self) -> pd.DataFrame:
+        return self._df_area().drop_duplicates(subset=["id"]).reset_index(drop=True)
+
+    def getCategoriesWithQuartile(self, quartiles: Set[str]) -> pd.DataFrame:
+        dfc = self._df_cat()
+        if dfc.empty:
+            return dfc.copy()
+        if not quartiles:
+            return dfc.drop_duplicates(subset=["id"]).reset_index(drop=True)
+        wanted = {q.upper() for q in quartiles}
+        mask = dfc["quartile"].astype(str).str.upper().isin(wanted)
+        return dfc.loc[mask].drop_duplicates(subset=["id"]).reset_index(drop=True)
+
+    def getCategoriesAssignedToAreas(self, areas: Set[str]) -> pd.DataFrame:
+        """
+        Return all categories that share at least one ISSN with the given areas.
+
+        The join is indirect (via the links table) because the data model uses
+        journals as the bridge entity between categories and areas.
+        """
+        df_links = self._df_links()
+        if df_links.empty:
+            return pd.DataFrame(columns=["id", "quartile"])
+
+        area_issns = (
+            df_links.loc[df_links["area"].isin(areas), "issn"].unique()
+            if areas
+            else df_links.loc[df_links["area"].notna(), "issn"].unique()
+        )
+        if len(area_issns) == 0:
+            return pd.DataFrame(columns=["id", "quartile"])
+
+        cats = df_links.loc[
+            df_links["issn"].isin(area_issns) & df_links["category"].notna(),
+            ["category", "quartile"],
+        ].drop_duplicates().rename(columns={"category": "id"})
+
+        return cats.drop_duplicates(subset=["id"]).reset_index(drop=True)
+
+    def getAreasAssignedToCategories(self, categories: Set[str]) -> pd.DataFrame:
+        """
+        Return all areas that share at least one ISSN with the given categories.
+
+        Same indirect-join pattern as getCategoriesAssignedToAreas.
+        """
+        df_links = self._df_links()
+        if df_links.empty:
+            return pd.DataFrame(columns=["id"])
+
+        cat_issns = (
+            df_links.loc[df_links["category"].isin(categories), "issn"].unique()
+            if categories
+            else df_links.loc[df_links["category"].notna(), "issn"].unique()
+        )
+        if len(cat_issns) == 0:
+            return pd.DataFrame(columns=["id"])
+
+        areas = df_links.loc[
+            df_links["issn"].isin(cat_issns) & df_links["area"].notna(),
+            ["area"],
+        ].drop_duplicates().rename(columns={"area": "id"})
+
+        return areas.drop_duplicates(subset=["id"]).reset_index(drop=True)
 
 
 # -------------------- Query engines --------------------
@@ -1097,4 +1150,3 @@ class FullQueryEngine(BasicQueryEngine):
 
         final = final.drop_duplicates(subset=["id"]).reset_index(drop=True)
         return self._journals_from_df(final)
-
