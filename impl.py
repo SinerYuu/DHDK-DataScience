@@ -1184,4 +1184,4 @@ class FullQueryEngine(BasicQueryEngine):
                     return False
                 return str(val).strip().lower() in ['false', 'no', '0', 'f']
             final = final[final["apc"].apply(is_diamond)]
-        return self._journals_from_df(final)0
+        return self._journals_from_df(final)
