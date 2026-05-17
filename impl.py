@@ -103,6 +103,12 @@ class Category(IdentifiableEntity):
         #Return all Quartiles for this Category.
         return sorted(self._quartiles)
 
+    def getQuartile(self) -> Optional[str]:
+        """Return the first (primary) quartile for this Category, or None if unranked.
+        Required by the UML diagram (getQuartile(): string or None)."""
+        qs = sorted(self._quartiles)
+        return qs[0] if qs else None
+
     def hasQuartile(self, q: Optional[str] = None) -> bool:
         #True if Category is ranked in the given Quartile or has any Quartile.
         if q:
@@ -199,8 +205,14 @@ class Journal(IdentifiableEntity):
         return len(self._areas) > 0
 
     def getIds(self) -> list:
-        # Returns a list containing this journal's ID (ISSN or title)
-        return [self._id] if self._id else []
+        # The id field may be a comma-separated list of ISSNs (e.g. "1234-5678, 8765-4321")
+        # stored that way during upload. Split and return all of them.
+        if isinstance(self._id, list):
+            return self._id
+        if isinstance(self._id, str) and self._id:
+            parts = [p.strip() for p in self._id.split(",") if p.strip()]
+            return parts if parts else []
+        return []
 
 
 # -------------------- Handler base classes --------------------
@@ -357,7 +369,11 @@ class JournalUploadHandler(UploadHandler):
 
             # Map each logical field to the actual column name in this CSV.
             # If a column is not found, the variable is None and the field is skipped.
-            col_issn      = pick("issn", "eissn", "pissn", "journal id", "identifier")
+            # Collect BOTH print ISSN and e-ISSN separately so we can store all IDs.
+            col_issn_print = pick("pissn", "print issn", "journal issn")
+            col_issn_e     = pick("eissn", "online issn", "electronic issn")
+            # Fallback: if neither specific column found, try generic "issn"
+            col_issn_generic = pick("issn", "journal id", "identifier") if not col_issn_print and not col_issn_e else None
             col_title     = pick("title")
             col_publisher = pick("publisher")
             col_license   = pick("license")
@@ -372,9 +388,24 @@ class JournalUploadHandler(UploadHandler):
 
             # Loop over every row in the CSV
             for _, row in df_raw.iterrows():
-                # Extract each field from the row.
-                # If a column was not found by pick(), use a safe default value.
-                issn      = str(row[col_issn]).strip()      if col_issn      else ""
+                # Collect all available ISSNs for this journal (print + electronic)
+                issn_parts = []
+                if col_issn_print:
+                    v = str(row[col_issn_print]).strip()
+                    if v and v.lower() not in ("", "nan", "none"):
+                        issn_parts.append(v)
+                if col_issn_e:
+                    v = str(row[col_issn_e]).strip()
+                    if v and v.lower() not in ("", "nan", "none"):
+                        issn_parts.append(v)
+                if col_issn_generic and not issn_parts:
+                    v = str(row[col_issn_generic]).strip()
+                    if v and v.lower() not in ("", "nan", "none"):
+                        issn_parts.append(v)
+                # Use comma-separated string of all ISSNs as the id
+                # (first ISSN is the primary one used for the RDF URI)
+                issn = issn_parts[0] if issn_parts else ""
+                all_issns = ", ".join(issn_parts)  # e.g. "1234-5678, 8765-4321"
                 title     = str(row[col_title]).strip()     if col_title     else ""
                 publisher = str(row[col_publisher]).strip() if col_publisher else ""
                 license_  = str(row[col_license]).strip()   if col_license   else ""
@@ -390,7 +421,7 @@ class JournalUploadHandler(UploadHandler):
 
                 # Add this journal to the local cache list as a plain dictionary
                 fallback_rows.append({
-                    "id": issn or title,  # use ISSN as ID; fall back to title if no ISSN
+                    "id": all_issns or title,  # store all ISSNs; fall back to title if none
                     "title": title,
                     "publisher": publisher,
                     "license": license_,
@@ -399,11 +430,13 @@ class JournalUploadHandler(UploadHandler):
                     "languages": languages,
                 })
 
-                # Only build RDF triples when an ISSN exists (required for a unique URI)
+                # Only build RDF triples when at least one ISSN exists (required for a unique URI)
                 if issn:
                     s = _build_journal_uri(issn)                      # unique URI for this journal
                     g.add((s, RDF.type, SCHEMA.Periodical))           # declare it is a journal
-                    g.add((s, SCHEMA.issn, Literal(issn)))            # store the ISSN value
+                    # Store ALL ISSNs so getIds() can return the full list
+                    for issn_val in issn_parts:
+                        g.add((s, SCHEMA.issn, Literal(issn_val)))
                     if title:
                         g.add((s, SCHEMA.name, Literal(title)))       # store the title
                     if publisher:
@@ -454,20 +487,7 @@ class JournalUploadHandler(UploadHandler):
             )
             return False
 
-class CategoryUploadHandler:
-    def __init__(self):
-        # The attribute name must match the one used in the query handler
-        self.dbPathOrUrl = ""
-
-    def setDbPathOrUrl(self, path: str) -> bool:
-        """设置数据库路径"""
-        self.dbPathOrUrl = path
-        return True
-
-    def getDbPathOrUrl(self) -> str:
-        """获取数据库路径"""
-        return self.dbPathOrUrl
-
+class CategoryUploadHandler(UploadHandler):
     def pushDataToDb(self, file_path: str) -> bool:
         # Check if the input file exists on the disk
         if not os.path.exists(file_path):
@@ -595,7 +615,28 @@ class JournalQueryHandler(QueryHandler):
 
             # Detect which type of filter was requested by inspecting the SPARQL filter string,
             # then apply the equivalent filter directly on the cache DataFrame
-            if "CONTAINS" in where_filter and "title" in where_filter:
+            if not where_filter:
+                pass  # no filter: return everything (used by getAllJournals)
+
+            elif "issn" in where_filter.lower() and "CONTAINS" not in where_filter:
+                # ISSN exact-match filter built by getById:
+                # FILTER (LCASE(STR(?issn)) = LCASE("..."))
+                match = re.search(r'LCASE\(STR\(\?issn\)\)\s*=\s*LCASE\("(.+?)"\)', where_filter)
+                if match:
+                    term = match.group(1).strip().lower()
+                    # id column may be comma-separated ISSNs; split and compare each part
+                    filtered_df = filtered_df[
+                        filtered_df["id"].astype(str).apply(
+                            lambda cell: any(
+                                part.strip().lower() == term
+                                for part in cell.split(",")
+                            )
+                        )
+                    ]
+                else:
+                    filtered_df = pd.DataFrame()  # unrecognised ISSN filter → no results
+
+            elif "CONTAINS" in where_filter and "title" in where_filter:
                 # Extract the search term from inside the SPARQL FILTER string using regex
                 match = re.search(r'CONTAINS\(.*?LCASE\("(.+?)"\)', where_filter)
                 if match:
@@ -632,6 +673,10 @@ class JournalQueryHandler(QueryHandler):
                         filtered_df.get("license", pd.Series(dtype=str))
                         .astype(str).str.lower().isin(lc_set)
                     ]
+
+            elif where_filter:
+                # Unrecognised filter pattern — don't return the full dataset as a false positive
+                filtered_df = pd.DataFrame()
 
             if limit:
                 filtered_df = filtered_df.head(limit)  # cap the number of results if requested
@@ -676,29 +721,24 @@ class JournalQueryHandler(QueryHandler):
     # ---- Public query methods ----
 
     def getById(self, id_value: str) -> pd.DataFrame:
-        """Find a journal by ISSN (exact match) or title (partial match).
-        If both match, the exact ISSN match is returned first."""
-        # FILTER checks ISSN equality OR title contains the input string.
-        # LCASE() = case-insensitive, || = logical OR, BOUND() = variable has a value.
-        where = f"""
-        FILTER (
-            LCASE(STR(?issn)) = LCASE("{id_value}")
-            || (BOUND(?title) && CONTAINS(LCASE(STR(?title)), LCASE("{id_value}")))
-        )
-        """
+        """Find a journal by ISSN (exact match on any stored ISSN).
+        Per spec, getById matches identifiers only — not titles."""
+        # Use exact ISSN equality in SPARQL
+        where = f'FILTER (LCASE(STR(?issn)) = LCASE("{id_value}"))'
         df = self._select_df(where_filter=where)
         if not df.empty:
-            # Prefer exact ISSN match over partial title match
-            ex = df.loc[df["id"].astype(str).str.lower() == str(id_value).lower()]
-            return ex.reset_index(drop=True) if not ex.empty else df.head(1).reset_index(drop=True)
+            return df.reset_index(drop=True)
 
-        # If nothing found via SPARQL/cache, try a direct lookup in the raw cache
+        # Fallback: search the local cache for any row whose id field contains this ISSN
         fb = self._fallback_df()
         if fb.empty:
             return pd.DataFrame()
-        mask = (
-            (fb["id"].astype(str).str.lower() == str(id_value).lower()) |
-            (fb.get("title", pd.Series(dtype=str)).astype(str).str.lower() == str(id_value).lower())
+        # id may be a comma-separated list of ISSNs (e.g. "1234-5678, 8765-4321")
+        mask = fb["id"].astype(str).apply(
+            lambda cell: any(
+                part.strip().lower() == id_value.strip().lower()
+                for part in cell.split(",")
+            )
         )
         matched = fb.loc[mask].reset_index(drop=True)
         return matched if not matched.empty else pd.DataFrame()
@@ -733,28 +773,18 @@ class JournalQueryHandler(QueryHandler):
 
     def getJournalsWithAPC(self) -> pd.DataFrame:
         """Return journals that charge Article Processing Charges (APC = True).
-        Uses "true"^^xsd:boolean (XSD typed literal) instead of bare true.
-        Without ^^xsd:boolean, some Blazegraph versions treat 'true' as a string."""
-        where = 'FILTER (BOUND(?apc) && (?apc = "true"^^xsd:boolean))'
+        Uses STR(?apc) = "true" for maximum Blazegraph compatibility — typed boolean
+        literals can behave inconsistently across Blazegraph versions."""
+        where = 'FILTER (BOUND(?apc) && (STR(?apc) = "true"))'
         return self._select_df(where_filter=where)
 
     def getJournalsWithDOAJSeal(self) -> pd.DataFrame:
         """Return journals that have the DOAJ Seal quality certification.
-        Same typed boolean pattern as getJournalsWithAPC."""
-        where = 'FILTER (BOUND(?seal) && (?seal = "true"^^xsd:boolean))'
+        Same STR-based boolean pattern as getJournalsWithAPC."""
+        where = 'FILTER (BOUND(?seal) && (STR(?seal) = "true"))'
         return self._select_df(where_filter=where)
 
-class CategoryQueryHandler:
-    def __init__(self):
-        self.dbPathOrUrl = ""
-
-    def setDbPathOrUrl(self, path: str) -> bool:
-        self.dbPathOrUrl = path
-        return True
-
-    def getDbPathOrUrl(self) -> str:
-        return self.dbPathOrUrl
-
+class CategoryQueryHandler(QueryHandler):
     def getById(self, id_value: str) -> pd.DataFrame:
         try:
             conn = sqlite3.connect(self.dbPathOrUrl)
@@ -976,35 +1006,47 @@ class BasicQueryEngine:
         if not identifier:
             return None
         target_id = str(identifier).strip().lower()
-        # --- JOURNAL LOOKUP ---
+
+        # --- JOURNAL LOOKUP: use getById (exact ISSN match) ---
         jdfs = []
         for h in self.journalQuery:
             try:
-                # 修复 1：使用 getAllJournals 替代 getById，防止底层多 ID 匹配失败
-                df = h.getAllJournals()
+                df = h.getById(identifier)
                 if isinstance(df, pd.DataFrame) and not df.empty:
                     clean = df.replace("", pd.NA).dropna(how="all")
                     if not clean.empty:
                         jdfs.append(clean)
             except Exception:
                 continue
+
+        if not jdfs:
+            # Fallback: scan getAllJournals and match any ISSN in the comma-separated id
+            for h in self.journalQuery:
+                try:
+                    df = h.getAllJournals()
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        mask = df["id"].astype(str).apply(
+                            lambda cell: any(
+                                part.strip().lower() == target_id
+                                for part in cell.split(",")
+                            )
+                        )
+                        matched = df.loc[mask]
+                        if not matched.empty:
+                            jdfs.append(matched)
+                except Exception:
+                    continue
+
         if jdfs:
             jdf = self._combine_df(jdfs)
-            jdf = jdf.replace("", pd.NA).dropna(how="all")
-            if not jdf.empty and "id" in jdf.columns:
-                exact = jdf[
-                    jdf["id"].astype(str).str.lower().str.contains(target_id, na=False, regex=False) |
-                    jdf["title"].astype(str).str.lower().str.contains(target_id, na=False, regex=False)
-                ]
-                if not exact.empty:
-                    js = self._journals_from_df(exact.head(1))
-                    if js:
-                        return js[0][0]
+            js = self._journals_from_df(jdf.head(1))
+            if js:
+                return js[0]
+
         # --- CATEGORY / AREA LOOKUP ---
         cdfs = []
         for h in self.categoryQuery:
             try:
-                # 同理拉取全量 DataFrame
                 df_cat = h.getAllCategories()
                 if isinstance(df_cat, pd.DataFrame) and not df_cat.empty:
                     cdfs.append(df_cat.replace("", pd.NA).dropna(how="all"))
@@ -1017,16 +1059,17 @@ class BasicQueryEngine:
             cdf = self._combine_df(cdfs)
             cdf = cdf.replace("", pd.NA).dropna(how="all")
             if not cdf.empty and "id" in cdf.columns:
-                exact_cat = cdf[cdf["id"].astype(str).str.lower().str.contains(target_id, na=False, regex=False)]
+                # Exact match only — partial matching would return false positives
+                exact_cat = cdf[cdf["id"].astype(str).str.lower() == target_id]
                 if not exact_cat.empty:
                     if "quartile" in exact_cat.columns and not exact_cat["quartile"].dropna().empty:
                         cats = self._categories_from_df(exact_cat.head(1))
                         if cats:
-                            return cats[0]  # 修复 2：必须返回单个对象
+                            return cats[0]
                     else:
                         ars = self._areas_from_df(exact_cat.head(1))
                         if ars:
-                            return ars[0]  # 修复 2：必须返回单个对象
+                            return ars[0]
         return None
 
     def getAllJournals(self) -> List[Journal]:
