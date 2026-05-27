@@ -664,6 +664,13 @@ class JournalQueryHandler(QueryHandler):
                 # Keep only rows where the doaj_seal column equals True
                 filtered_df = filtered_df[filtered_df.get("doaj_seal") == True]
 
+            elif "NOT EXISTS" in where_filter and "publisher" in where_filter:
+                # getJournalsWithNoPublisher: keep rows with empty/missing publisher
+                filtered_df = filtered_df[
+                    filtered_df["publisher"].isna() |
+                    filtered_df["publisher"].astype(str).str.strip().str.lower().isin(["", "none", "nan"])
+                ]
+
             elif "license" in where_filter:
                 # Extract all license strings from the SPARQL filter and match against cache
                 licenses = re.findall(r'LCASE\("(.+?)"\)', where_filter)
@@ -784,6 +791,34 @@ class JournalQueryHandler(QueryHandler):
         where = 'FILTER (BOUND(?seal) && (STR(?seal) = "true"))'
         return self._select_df(where_filter=where)
 
+    def getJournalsWithNoPublisher(self) -> pd.DataFrame:
+        """Return all journals that do NOT have a publisher specified.
+
+        How it works:
+        - In the RDF graph, publisher is stored as an OPTIONAL triple with schema:publisher.
+        - When a journal has no publisher, the ?publisher variable is unbound (missing).
+        - SPARQL's NOT EXISTS checks that the publisher triple does not exist at all
+          for a given journal URI ?s.
+        - In the local cache fallback, we check for rows where publisher is empty,
+          None, NaN, or the literal string 'None'/'nan'.
+        """
+        # NOT EXISTS is more reliable than !BOUND(?publisher) in some Blazegraph versions,
+        # because OPTIONAL + FILTER(!BOUND) can behave differently from NOT EXISTS.
+        where = 'FILTER NOT EXISTS { ?s schema:publisher ?publisher }'
+        df = self._select_df(where_filter=where)
+        if not df.empty:
+            return df
+
+        # Cache fallback: treat empty string, NaN, None, 'nan', 'none' as "no publisher"
+        fb = self._fallback_df()
+        if fb.empty:
+            return pd.DataFrame()
+        no_pub_mask = (
+            fb["publisher"].isna() |
+            fb["publisher"].astype(str).str.strip().str.lower().isin(["", "none", "nan"])
+        )
+        return fb.loc[no_pub_mask].reset_index(drop=True)
+
 class CategoryQueryHandler(QueryHandler):
     def getById(self, id_value: str) -> pd.DataFrame:
         try:
@@ -846,6 +881,36 @@ class CategoryQueryHandler(QueryHandler):
             return cats.drop_duplicates(subset=["id"]).reset_index(drop=True)
         except:
             return pd.DataFrame(columns=["id", "quartile"])
+
+    def getCategoriesByName(self, cat_partial_name: str) -> pd.DataFrame:
+        """Return all categories whose name (id) matches, even partially, the given string.
+
+        How it works:
+        - The category 'id' column in the relational database stores the category name
+          (e.g. 'Artificial Intelligence', 'Oncology').
+        - We do a case-insensitive SQL LIKE query using the % wildcard on both sides,
+          which means the search term can appear anywhere inside the name.
+        - We return no duplicates (DISTINCT) — each category appears only once.
+
+        Example: getCategoriesByName("intel") would match "Artificial Intelligence".
+        """
+        try:
+            conn = sqlite3.connect(self.dbPathOrUrl)
+            # LOWER() ensures case-insensitive matching even in SQLite,
+            # which does not apply LIKE case-insensitively to non-ASCII chars by default.
+            # The % wildcards allow the term to appear anywhere in the name.
+            query = """
+                SELECT DISTINCT id, quartile
+                FROM categories
+                WHERE LOWER(id) LIKE LOWER(?)
+            """
+            # Wrap the search term with % wildcards for partial (substring) matching
+            search_term = f"%{cat_partial_name}%"
+            df = pd.read_sql_query(query, conn, params=(search_term,))
+            conn.close()
+            return df.drop_duplicates(subset=["id"]).reset_index(drop=True)
+        except Exception:
+            return pd.DataFrame()
 
     def getAreasAssignedToCategories(self, categories: Set[str]) -> pd.DataFrame:
         # Find all areas that are linked to the given categories via the links table.
@@ -1191,6 +1256,76 @@ class FullQueryEngine(BasicQueryEngine):
         if licenses and "license" in joined.columns:
             norm_lics = {x.strip().lower() for x in licenses}
             joined = joined.loc[joined["license"].astype(str).str.strip().str.lower().isin(norm_lics)]
+        return self._journals_from_df(joined)
+
+    def getJournalsWithNoPublisherInCategories(self, cat_partial_name: str) -> List[Journal]:
+        """Return all journals that have no publisher AND belong to at least one
+        category whose name matches (even partially) the given string.
+
+        How it works step by step:
+        1. Ask each JournalQueryHandler for journals with no publisher → get a DataFrame.
+        2. Ask each CategoryQueryHandler for categories whose name partially matches
+           cat_partial_name → get a DataFrame of matching categories.
+        3. Use the links table (issn ↔ category) to find which journals are associated
+           with at least one of those matching categories.
+        4. Keep only the journals that appear in BOTH sets (intersection by ISSN).
+        5. Convert the surviving rows into Journal objects and return them.
+
+        Example:
+            getJournalsWithNoPublisherInCategories("intelligence")
+            → journals with no publisher that are linked to e.g. "Artificial Intelligence"
+        """
+
+        # ── Step 1: collect all no-publisher journals from every JournalQueryHandler ──
+        no_pub_frames = []
+        for h in self.journalQuery:
+            try:
+                df = h.getJournalsWithNoPublisher()
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    no_pub_frames.append(df)
+            except Exception:
+                continue
+        if not no_pub_frames:
+            return []  # no journals without publisher found at all
+        no_pub_df = self._combine_df(no_pub_frames)  # merge results from all handlers
+
+        # ── Step 2: collect matching categories from every CategoryQueryHandler ──
+        cat_frames = []
+        for h in self.categoryQuery:
+            try:
+                df = h.getCategoriesByName(cat_partial_name)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    cat_frames.append(df)
+            except Exception:
+                continue
+        if not cat_frames:
+            return []  # no categories match the given name
+        cat_df = self._combine_df(cat_frames)  # merge results from all handlers
+
+        # Build a normalised set of matching category names for fast lookup
+        # (category id == category name in the relational database)
+        matching_cat_names = set(
+            cat_df["id"].astype(str).str.strip().str.lower().unique()
+        )
+
+        # ── Step 3: filter the links table to only rows with a matching category ──
+        ldf = self._links_df()
+        if ldf.empty or "category" not in ldf.columns:
+            return []
+        # Keep only link rows whose category is one of the matched names
+        ldf_filtered = ldf[
+            ldf["category"].astype(str).str.strip().str.lower().isin(matching_cat_names)
+        ]
+        if ldf_filtered.empty:
+            return []
+
+        # ── Step 4: join no-publisher journals with the filtered link rows ──
+        # _join_on_ids matches journal "id" (ISSN) against link "issn" column
+        joined = self._join_on_ids(no_pub_df, ldf_filtered)
+        if joined.empty:
+            return []
+
+        # ── Step 5: convert surviving DataFrame rows into Journal objects ──
         return self._journals_from_df(joined)
 
     def getDiamondJournalsInAreasAndCategoriesWithQuartile(self, areas: Set[str], categories: Set[str], quartiles: Set[str]) -> List[Journal]:
