@@ -793,14 +793,6 @@ class JournalQueryHandler(QueryHandler):
 
     def getJournalsWithNoPublisher(self) -> pd.DataFrame:
         """Return all journals that do NOT have a publisher specified.
-
-        How it works:
-        - In the RDF graph, publisher is stored as an OPTIONAL triple with schema:publisher.
-        - When a journal has no publisher, the ?publisher variable is unbound (missing).
-        - SPARQL's NOT EXISTS checks that the publisher triple does not exist at all
-          for a given journal URI ?s.
-        - In the local cache fallback, we check for rows where publisher is empty,
-          None, NaN, or the literal string 'None'/'nan'.
         """
         # NOT EXISTS is more reliable than !BOUND(?publisher) in some Blazegraph versions,
         # because OPTIONAL + FILTER(!BOUND) can behave differently from NOT EXISTS.
@@ -884,15 +876,6 @@ class CategoryQueryHandler(QueryHandler):
 
     def getCategoriesByName(self, cat_partial_name: str) -> pd.DataFrame:
         """Return all categories whose name (id) matches, even partially, the given string.
-
-        How it works:
-        - The category 'id' column in the relational database stores the category name
-          (e.g. 'Artificial Intelligence', 'Oncology').
-        - We do a case-insensitive SQL LIKE query using the % wildcard on both sides,
-          which means the search term can appear anywhere inside the name.
-        - We return no duplicates (DISTINCT) — each category appears only once.
-
-        Example: getCategoriesByName("intel") would match "Artificial Intelligence".
         """
         try:
             conn = sqlite3.connect(self.dbPathOrUrl)
@@ -1261,22 +1244,9 @@ class FullQueryEngine(BasicQueryEngine):
     def getJournalsWithNoPublisherInCategories(self, cat_partial_name: str) -> List[Journal]:
         """Return all journals that have no publisher AND belong to at least one
         category whose name matches (even partially) the given string.
-
-        How it works step by step:
-        1. Ask each JournalQueryHandler for journals with no publisher → get a DataFrame.
-        2. Ask each CategoryQueryHandler for categories whose name partially matches
-           cat_partial_name → get a DataFrame of matching categories.
-        3. Use the links table (issn ↔ category) to find which journals are associated
-           with at least one of those matching categories.
-        4. Keep only the journals that appear in BOTH sets (intersection by ISSN).
-        5. Convert the surviving rows into Journal objects and return them.
-
-        Example:
-            getJournalsWithNoPublisherInCategories("intelligence")
-            → journals with no publisher that are linked to e.g. "Artificial Intelligence"
         """
 
-        # ── Step 1: collect all no-publisher journals from every JournalQueryHandler ──
+        # Step 1: collect all no-publisher journals from every JournalQueryHandler 
         no_pub_frames = []
         for h in self.journalQuery:
             try:
@@ -1289,7 +1259,7 @@ class FullQueryEngine(BasicQueryEngine):
             return []  # no journals without publisher found at all
         no_pub_df = self._combine_df(no_pub_frames)  # merge results from all handlers
 
-        # ── Step 2: collect matching categories from every CategoryQueryHandler ──
+        # Step 2: collect matching categories from every CategoryQueryHandler 
         cat_frames = []
         for h in self.categoryQuery:
             try:
@@ -1308,7 +1278,7 @@ class FullQueryEngine(BasicQueryEngine):
             cat_df["id"].astype(str).str.strip().str.lower().unique()
         )
 
-        # ── Step 3: filter the links table to only rows with a matching category ──
+        # Step 3: filter the links table to only rows with a matching category 
         ldf = self._links_df()
         if ldf.empty or "category" not in ldf.columns:
             return []
@@ -1319,13 +1289,13 @@ class FullQueryEngine(BasicQueryEngine):
         if ldf_filtered.empty:
             return []
 
-        # ── Step 4: join no-publisher journals with the filtered link rows ──
+        # Step 4: join no-publisher journals with the filtered link rows
         # _join_on_ids matches journal "id" (ISSN) against link "issn" column
         joined = self._join_on_ids(no_pub_df, ldf_filtered)
         if joined.empty:
             return []
 
-        # ── Step 5: convert surviving DataFrame rows into Journal objects ──
+        # Step 5: convert surviving DataFrame rows into Journal objects 
         return self._journals_from_df(joined)
 
     def getDiamondJournalsInAreasAndCategoriesWithQuartile(self, areas: Set[str], categories: Set[str], quartiles: Set[str]) -> List[Journal]:
