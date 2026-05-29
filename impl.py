@@ -792,16 +792,16 @@ class JournalQueryHandler(QueryHandler):
         return self._select_df(where_filter=where)
 
     def getJournalsWithNoPublisher(self) -> pd.DataFrame:
-        """Return all journals that do NOT have a publisher specified.
-        """
-        # NOT EXISTS is more reliable than !BOUND(?publisher) in some Blazegraph versions,
-        # because OPTIONAL + FILTER(!BOUND) can behave differently from NOT EXISTS.
-        where = 'FILTER NOT EXISTS { ?s schema:publisher ?publisher }'
+        # Method with no parameters, return  a table of j with no publ
+    
+        where = 'FILTER NOT EXISTS { ?s schema:publisher ?publisher }' 
+        # SPARQL FILTER, keeps only j where publ triple NOT EXIST at all
         df = self._select_df(where_filter=where)
+        # send the FILTER to Bl and get result
         if not df.empty:
             return df
 
-        # Cache fallback: treat empty string, NaN, None, 'nan', 'none' as "no publisher"
+        # Cache fallback, copy of data
         fb = self._fallback_df()
         if fb.empty:
             return pd.DataFrame()
@@ -809,7 +809,9 @@ class JournalQueryHandler(QueryHandler):
             fb["publisher"].isna() |
             fb["publisher"].astype(str).str.strip().str.lower().isin(["", "none", "nan"])
         )
+        # Boolean mask TRUE if publ is empty, None, NaN no publisher
         return fb.loc[no_pub_mask].reset_index(drop=True)
+        # Apply the mask, keep only rows WHERE TRUE, return result
 
 class CategoryQueryHandler(QueryHandler):
     def getById(self, id_value: str) -> pd.DataFrame:
@@ -875,21 +877,23 @@ class CategoryQueryHandler(QueryHandler):
             return pd.DataFrame(columns=["id", "quartile"])
 
     def getCategoriesByName(self, cat_partial_name: str) -> pd.DataFrame:
-        """Return all categories whose name (id) matches, even partially, the given string.
+        """Searches category by partial name match
+        takes search text as input
         """
         try:
             conn = sqlite3.connect(self.dbPathOrUrl)
-            # LOWER() ensures case-insensitive matching even in SQLite,
-            # which does not apply LIKE case-insensitively to non-ASCII chars by default.
-            # The % wildcards allow the term to appear anywhere in the name.
+            # using stored path
+            # get unique rows from categories where the name matches
             query = """
                 SELECT DISTINCT id, quartile
                 FROM categories
                 WHERE LOWER(id) LIKE LOWER(?)
             """
-            # Wrap the search term with % wildcards for partial (substring) matching
+            # any characters can appear, if the input intel
+            # enables partial matching
             search_term = f"%{cat_partial_name}%"
             df = pd.read_sql_query(query, conn, params=(search_term,))
+            # execute sql, pass 3 things
             conn.close()
             return df.drop_duplicates(subset=["id"]).reset_index(drop=True)
         except Exception:
@@ -1248,16 +1252,16 @@ class FullQueryEngine(BasicQueryEngine):
 
         # Step 1: collect all no-publisher journals from every JournalQueryHandler 
         no_pub_frames = []
-        for h in self.journalQuery:
+        for h in self.journalQuery: # loop through all journal
             try:
-                df = h.getJournalsWithNoPublisher()
+                df = h.getJournalsWithNoPublisher() # call on each one
                 if isinstance(df, pd.DataFrame) and not df.empty:
-                    no_pub_frames.append(df)
+                    no_pub_frames.append(df) # collect all the result
             except Exception:
                 continue
         if not no_pub_frames:
             return []  # no journals without publisher found at all
-        no_pub_df = self._combine_df(no_pub_frames)  # merge results from all handlers
+        no_pub_df = self._combine_df(no_pub_frames)  # combine them in one table
 
         # Step 2: collect matching categories from every CategoryQueryHandler 
         cat_frames = []
@@ -1272,25 +1276,23 @@ class FullQueryEngine(BasicQueryEngine):
             return []  # no categories match the given name
         cat_df = self._combine_df(cat_frames)  # merge results from all handlers
 
-        # Build a normalised set of matching category names for fast lookup
-        # (category id == category name in the relational database)
-        matching_cat_names = set(
-            cat_df["id"].astype(str).str.strip().str.lower().unique()
+        matching_cat_names = set( # Take all category names from the result and put in a set, no dublicates
+            cat_df["id"].astype(str).str.strip().str.lower().unique() # convert everything to low and case insensitive
         )
 
-        # Step 3: filter the links table to only rows with a matching category 
-        ldf = self._links_df()
+        # Step 3: 
+        ldf = self._links_df() # get the links table, which journal belongs to which category
         if ldf.empty or "category" not in ldf.columns:
             return []
-        # Keep only link rows whose category is one of the matched names
-        ldf_filtered = ldf[
+        # Keep only link rows whose category is one of the matched names filter the links table
+        ldf_filtered = ldf[ 
             ldf["category"].astype(str).str.strip().str.lower().isin(matching_cat_names)
         ]
         if ldf_filtered.empty:
             return []
 
         # Step 4: join no-publisher journals with the filtered link rows
-        # _join_on_ids matches journal "id" (ISSN) against link "issn" column
+        # join the two tables by ISSN 
         joined = self._join_on_ids(no_pub_df, ldf_filtered)
         if joined.empty:
             return []
