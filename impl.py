@@ -378,7 +378,7 @@ class JournalUploadHandler(UploadHandler):
             col_publisher = pick("publisher")
             col_license   = pick("license")
             col_apc       = pick("apc", "article processing charge", "processing charges")
-            col_seal      = pick("seal", "doaj")
+            col_seal      = pick("doaj seal", "seal")
             col_lang      = pick("language")
 
             g = Graph()               # create an empty RDF graph in memory (not in Blazegraph yet)
@@ -827,9 +827,14 @@ class CategoryQueryHandler(QueryHandler):
     def getAllCategories(self) -> pd.DataFrame:
         try:
             conn = sqlite3.connect(self.dbPathOrUrl)
-            df = pd.read_sql_query("SELECT * FROM categories", conn)
+            # Use DISTINCT on id to avoid returning the same category multiple times.
+            # The categories table stores one row per (id, quartile) pair, so without
+            # deduplication the same category name appears once per quartile it has.
+            df = pd.read_sql_query(
+                "SELECT DISTINCT id, quartile FROM categories", conn
+            )
             conn.close()
-            return df
+            return df.drop_duplicates(subset=["id"]).reset_index(drop=True)
         except:
             return pd.DataFrame()
 
@@ -1193,25 +1198,28 @@ class FullQueryEngine(BasicQueryEngine):
         if "id" in jdf.columns and "issn" in ldf.columns:
             j_temp = jdf.copy()
             l_temp = ldf.copy()
-            # 将以逗号分隔的 ISSN 字符串切分成列表
             # Split comma-separated ISSN strings into lists
             j_temp['join_id'] = j_temp['id'].astype(str).str.split(',')
             l_temp['join_issn'] = l_temp['issn'].astype(str).str.split(',')
-            # 展开（Explode）列表，使每个 ISSN 独立成行，确保 Inner Merge 能精准命中
             # Explode lists so each ISSN becomes its own row for precise merging
             j_temp = j_temp.explode('join_id')
             l_temp = l_temp.explode('join_issn')
-            # 消除可能的空格和大小写差异
             # Remove whitespace and case differences for reliable matching
             j_temp['join_id'] = j_temp['join_id'].str.strip().str.lower()
             l_temp['join_issn'] = l_temp['join_issn'].str.strip().str.lower()
-            # 过滤掉空字符串并执行合并
             # Filter out empty strings and merge
             j_temp = j_temp[j_temp['join_id'] != '']
+            # Rename 'id' in ldf to avoid id_x / id_y collision after merge
+            if "id" in l_temp.columns:
+                l_temp = l_temp.rename(columns={"id": "link_id"})
             merged = j_temp.merge(l_temp, left_on="join_id", right_on="join_issn", how="inner")
-            # 清理临时列并返回
             # Drop temporary helper columns before returning
-            return merged.drop(columns=['join_id', 'join_issn'])
+            drop_cols = [c for c in ['join_id', 'join_issn', 'link_id'] if c in merged.columns]
+            merged = merged.drop(columns=drop_cols)
+            # Deduplicate on journal id so each journal appears only once
+            if "id" in merged.columns:
+                merged = merged.drop_duplicates(subset=["id"])
+            return merged
         return pd.DataFrame()
 
     def getJournalsInCategoriesWithQuartile(self, categories: Set[str], quartiles: Set[str]) -> List[Journal]:
@@ -1219,8 +1227,6 @@ class FullQueryEngine(BasicQueryEngine):
         ldf = self._links_df()
         if jdf.empty or ldf.empty:
             return []
-        # 规范化查询集合，消除大小写和空格差异
-        # Normalize input sets to eliminate case and whitespace differences
         norm_cats = {c.strip().lower() for c in categories} if categories else set()
         norm_qs = {q.strip().upper() for q in quartiles} if quartiles else set()
         cat_mask = ldf["category"].notna() if not categories else ldf["category"].astype(str).str.strip().str.lower().isin(norm_cats)
